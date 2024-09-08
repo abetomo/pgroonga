@@ -445,8 +445,7 @@ module Helpers
       major, minor, micro, tag = groonga_version
       compared = ([major, minor, micro] <=>
                   [required_major, required_minor, required_micro])
-      return if compared > 0
-      return if compared == 0 and tag.nil?
+      return if compared >= 0
       if tag and [major, minor, micro + 1] ==
                  [required_major, required_minor, required_micro]
         # Unreleased version
