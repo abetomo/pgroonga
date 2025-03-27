@@ -113,7 +113,11 @@ PGrnPlanCustomPath(PlannerInfo *root,
 				   List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
+
 	cscan->methods = &PGrnScanMethods;
+	cscan->scan.scanrelid = rel->relid;
+	cscan->scan.plan.targetlist = tlist;
+
 	return &(cscan->scan.plan);
 }
 
