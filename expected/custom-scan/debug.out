@@ -13,6 +13,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM memos;
 SELECT * FROM memos;
  content 
 ---------
-(0 rows)
+ Groonga
+(1 row)
 
 DROP TABLE memos;

@@ -4,6 +4,7 @@
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <optimizer/restrictinfo.h>
+#include <utils/builtins.h>
 
 #include "pgrn-custom-scan.h"
 #include "pgroonga.h"
@@ -11,6 +12,7 @@
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
+	bool ended;
 } PGrnScanState;
 
 static bool PGrnCustomScanEnabled = false;
@@ -141,14 +143,29 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 }
 
 static void
-PGrnBeginCustomScan(CustomScanState *cscanstate, EState *estate, int eflags)
+PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
+	PGrnScanState *state = (PGrnScanState *) node;
+	state->ended = false;
 }
 
 static TupleTableSlot *
 PGrnExecCustomScan(CustomScanState *node)
 {
-	return NULL;
+	PGrnScanState *state = (PGrnScanState *) node;
+	if (state->ended)
+	{
+		return NULL;
+	}
+
+	{
+		TupleTableSlot *slot = node->ss.ps.ps_ResultTupleSlot;
+		ExecClearTuple(slot);
+		slot->tts_values[0] = CStringGetTextDatum("Groonga");
+		slot->tts_isnull[0] = false;
+		state->ended = true;
+		return ExecStoreVirtualTuple(slot);
+	}
 }
 
 static void
