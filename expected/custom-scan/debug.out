@@ -2,6 +2,8 @@
 CREATE TABLE memos (content text);
 CREATE INDEX memos_content ON memos USING pgroonga (content);
 INSERT INTO memos VALUES ('PGroonga');
+INSERT INTO memos VALUES ('Groonga');
+INSERT INTO memos VALUES ('Mroonga');
 SET pgroonga.enable_custom_scan = on;
 EXPLAIN (COSTS OFF) SELECT * FROM memos;
              QUERY PLAN              
@@ -11,9 +13,11 @@ EXPLAIN (COSTS OFF) SELECT * FROM memos;
 (2 rows)
 
 SELECT * FROM memos;
- content 
----------
+ content  
+----------
+ PGroonga
  Groonga
-(1 row)
+ Mroonga
+(3 rows)
 
 DROP TABLE memos;

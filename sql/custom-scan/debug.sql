@@ -3,6 +3,8 @@
 CREATE TABLE memos (content text);
 CREATE INDEX memos_content ON memos USING pgroonga (content);
 INSERT INTO memos VALUES ('PGroonga');
+INSERT INTO memos VALUES ('Groonga');
+INSERT INTO memos VALUES ('Mroonga');
 
 SET pgroonga.enable_custom_scan = on;
 

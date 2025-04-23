@@ -5,14 +5,19 @@
 #include <optimizer/paths.h>
 #include <optimizer/restrictinfo.h>
 #include <utils/builtins.h>
+#include <utils/lsyscache.h>
+
+#include "pgroonga.h"
 
 #include "pgrn-custom-scan.h"
-#include "pgroonga.h"
+#include "pgrn-groonga.h"
 
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
-	bool ended;
+	grn_table_cursor *cursor;
+	grn_obj *column; // todo
+	Oid columTypeId; // todo
 } PGrnScanState;
 
 static bool PGrnCustomScanEnabled = false;
@@ -97,6 +102,12 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 		return;
 	}
 
+	if (get_rel_relkind(rte->relid) != RELKIND_RELATION)
+	{
+		// Only table scan is supported.
+		return;
+	}
+
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;
@@ -142,28 +153,91 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 	return (Node *) &(state->parent);
 }
 
+static grn_obj *
+PGrnLookupSourcesTableFromRel(Relation rel, int errorLevel)
+{
+	ListCell *lc;
+	List *indexes = RelationGetIndexList(rel);
+	grn_obj *table;
+
+	if (!rel)
+	{
+		return NULL;
+	}
+
+	foreach (lc, indexes)
+	{
+		Oid indexId = lfirst_oid(lc);
+
+		Relation index = RelationIdGetRelation(indexId);
+		if (!PGrnIndexIsPGroonga(index))
+		{
+			RelationClose(index);
+			continue;
+		}
+		table = PGrnLookupSourcesTable(index, ERROR);
+		RelationClose(index);
+		break;
+	}
+	return table;
+}
+
 static void
 PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
 	PGrnScanState *state = (PGrnScanState *) node;
-	state->ended = false;
+	CustomScanState *customScanState = (CustomScanState *) state;
+	TupleDesc tupdesc =
+		RelationGetDescr(customScanState->ss.ss_currentRelation);
+	grn_obj *sourceTable;
+
+	state->cursor = NULL;
+	sourceTable = PGrnLookupSourcesTableFromRel(
+		customScanState->ss.ss_currentRelation, ERROR);
+
+	if (sourceTable && grn_table_size(ctx, sourceTable) > 0)
+	{
+		state->cursor = grn_table_cursor_open(
+			ctx, sourceTable, NULL, 0, NULL, 0, 0, -1, GRN_CURSOR_ASCENDING);
+		if (state->cursor)
+		{
+			// todo
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
+			state->column =
+				PGrnLookupColumn(sourceTable, NameStr(attr->attname), ERROR);
+			state->columTypeId = attr->atttypid;
+		}
+	}
 }
 
 static TupleTableSlot *
 PGrnExecCustomScan(CustomScanState *node)
 {
 	PGrnScanState *state = (PGrnScanState *) node;
-	if (state->ended)
+	grn_id id;
+
+	if (!state->cursor)
+	{
+		return NULL;
+	}
+
+	id = grn_table_cursor_next(ctx, state->cursor);
+	if (!id)
 	{
 		return NULL;
 	}
 
 	{
 		TupleTableSlot *slot = node->ss.ps.ps_ResultTupleSlot;
+		grn_obj value;
+
 		ExecClearTuple(slot);
-		slot->tts_values[0] = CStringGetTextDatum("Groonga");
+		GRN_VOID_INIT(&value);
+		grn_obj_get_value(ctx, state->column, id, &value);
+		slot->tts_values[0] = PGrnConvertToDatum(&value, state->columTypeId);
 		slot->tts_isnull[0] = false;
-		state->ended = true;
+		GRN_OBJ_FIN(ctx, &value);
+
 		return ExecStoreVirtualTuple(slot);
 	}
 }
@@ -177,6 +251,10 @@ PGrnExplainCustomScan(CustomScanState *node, List *ancestors, ExplainState *es)
 static void
 PGrnEndCustomScan(CustomScanState *node)
 {
+	PGrnScanState *state = (PGrnScanState *) node;
+	grn_table_cursor_close(ctx, state->cursor);
+	grn_obj_unlink(ctx, state->column);
+	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 }
 
 static void
