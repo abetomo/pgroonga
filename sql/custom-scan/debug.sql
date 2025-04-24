@@ -8,7 +8,7 @@ INSERT INTO memos VALUES ('Mroonga');
 
 SET pgroonga.enable_custom_scan = on;
 
-EXPLAIN (COSTS OFF) SELECT * FROM memos;
-SELECT * FROM memos;
+EXPLAIN (COSTS OFF) SELECT * FROM memos where content &@ 'Groonga';
+SELECT * FROM memos where content &@ 'Groonga';
 
 DROP TABLE memos;

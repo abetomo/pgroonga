@@ -1,5 +1,6 @@
 #include <postgres.h>
 
+#include <access/skey.h>
 #include <nodes/extensible.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
@@ -11,6 +12,7 @@
 
 #include "pgrn-custom-scan.h"
 #include "pgrn-groonga.h"
+#include "pgrn-search.h"
 
 typedef struct PGrnScanState
 {
@@ -18,6 +20,8 @@ typedef struct PGrnScanState
 	grn_table_cursor *cursor;
 	grn_obj *column; // todo
 	Oid columTypeId; // todo
+	PGrnSearchData data;
+	grn_obj *searched;
 } PGrnScanState;
 
 static bool PGrnCustomScanEnabled = false;
@@ -130,6 +134,7 @@ PGrnPlanCustomPath(PlannerInfo *root,
 	cscan->methods = &PGrnScanMethods;
 	cscan->scan.scanrelid = rel->relid;
 	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
 
 	return &(cscan->scan.plan);
 }
@@ -153,12 +158,11 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 	return (Node *) &(state->parent);
 }
 
-static grn_obj *
-PGrnLookupSourcesTableFromRel(Relation rel, int errorLevel)
+static Relation
+PGrnLookupIndex(Relation rel, int errorLevel)
 {
 	ListCell *lc;
 	List *indexes = RelationGetIndexList(rel);
-	grn_obj *table;
 
 	if (!rel)
 	{
@@ -175,11 +179,9 @@ PGrnLookupSourcesTableFromRel(Relation rel, int errorLevel)
 			RelationClose(index);
 			continue;
 		}
-		table = PGrnLookupSourcesTable(index, ERROR);
-		RelationClose(index);
-		break;
+		return index;
 	}
-	return table;
+	return NULL;
 }
 
 static void
@@ -189,22 +191,91 @@ PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	CustomScanState *customScanState = (CustomScanState *) state;
 	TupleDesc tupdesc =
 		RelationGetDescr(customScanState->ss.ss_currentRelation);
-	grn_obj *sourceTable;
+	Relation index;
+	grn_obj *sourcesTable;
+	List *quals = node->ss.ps.plan->qual;
 
 	state->cursor = NULL;
-	sourceTable = PGrnLookupSourcesTableFromRel(
-		customScanState->ss.ss_currentRelation, ERROR);
+	state->searched = NULL;
 
-	if (sourceTable && grn_table_size(ctx, sourceTable) > 0)
+	index = PGrnLookupIndex(customScanState->ss.ss_currentRelation, ERROR);
+	sourcesTable = PGrnLookupSourcesTable(index, ERROR);
+
 	{
-		state->cursor = grn_table_cursor_open(
-			ctx, sourceTable, NULL, 0, NULL, 0, 0, -1, GRN_CURSOR_ASCENDING);
+		ScanKeyData scankey;
+		ListCell *lc;
+
+		PGrnSearchDataInit(&(state->data), index, sourcesTable);
+		foreach (lc, quals)
+		{
+			Expr *expr = (Expr *) lfirst(lc);
+			OpExpr *opexpr;
+			if (!IsA(expr, OpExpr))
+			{
+				continue;
+			}
+
+			opexpr = (OpExpr *) expr;
+			if (list_length(opexpr->args) == 2)
+			{
+				Var *column = (Var *) linitial(opexpr->args);
+				Const *value = (Const *) lsecond(opexpr->args);
+				int strategy;
+				Oid opFamily = index->rd_opfamily[0];
+				Oid leftType;
+				Oid rightType;
+
+				get_op_opfamily_properties(opexpr->opno,
+										   opFamily,
+										   false,
+										   &strategy,
+										   &leftType,
+										   &rightType);
+				ScanKeyInit(&scankey,
+							column->varattno,
+							strategy,
+							opexpr->opfuncid,
+							value->constvalue);
+				PGrnSearchBuildCondition(index, &scankey, &(state->data));
+			}
+		}
+	}
+	RelationClose(index);
+
+	if (sourcesTable && grn_table_size(ctx, sourcesTable) > 0)
+	{
+
+		state->searched =
+			grn_table_create(ctx,
+							 NULL,
+							 0,
+							 NULL,
+							 GRN_OBJ_TABLE_HASH_KEY | GRN_OBJ_WITH_SUBREC,
+							 sourcesTable,
+							 0);
+		if (!state->data.isEmptyCondition)
+		{
+			grn_table_selector *table_selector = grn_table_selector_open(
+				ctx, sourcesTable, state->data.expression, GRN_OP_OR);
+			grn_table_selector_select(ctx, table_selector, state->searched);
+			grn_table_selector_close(ctx, table_selector);
+		}
+
+		state->cursor = grn_table_cursor_open(ctx,
+											  state->searched,
+											  NULL,
+											  0,
+											  NULL,
+											  0,
+											  0,
+											  -1,
+											  GRN_CURSOR_ASCENDING);
 		if (state->cursor)
 		{
 			// todo
 			Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
-			state->column =
-				PGrnLookupColumn(sourceTable, NameStr(attr->attname), ERROR);
+			state->column = PGrnLookupColumn(
+				state->searched, NameStr(attr->attname), ERROR);
 			state->columTypeId = attr->atttypid;
 		}
 	}
@@ -252,6 +323,12 @@ static void
 PGrnEndCustomScan(CustomScanState *node)
 {
 	PGrnScanState *state = (PGrnScanState *) node;
+	PGrnSearchDataFree(&(state->data));
+	if (state->searched)
+	{
+		grn_obj_close(ctx, state->searched);
+		state->searched = NULL;
+	}
 	grn_table_cursor_close(ctx, state->cursor);
 	grn_obj_unlink(ctx, state->column);
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
