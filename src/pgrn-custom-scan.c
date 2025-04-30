@@ -14,6 +14,15 @@
 #include "pgrn-groonga.h"
 #include "pgrn-search.h"
 
+Datum pgroonga_score_cs(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(pgroonga_score_cs);
+
+Datum
+pgroonga_score_cs(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(0);
+}
+
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
@@ -22,6 +31,8 @@ typedef struct PGrnScanState
 	Oid columTypeId; // todo
 	PGrnSearchData data;
 	grn_obj *searched;
+	grn_obj *scoreAccessor;
+	FuncExpr *debugFuncExpr;
 } PGrnScanState;
 
 static bool PGrnCustomScanEnabled = false;
@@ -116,6 +127,9 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;
 	cpath->path.pathtarget = rel->reltarget;
+
+	cpath->flags |= CUSTOMPATH_SUPPORT_PROJECTION;
+
 	cpath->methods = &PGrnPathMethods;
 
 	add_path(rel, &cpath->path);
@@ -134,6 +148,8 @@ PGrnPlanCustomPath(PlannerInfo *root,
 	cscan->methods = &PGrnScanMethods;
 	cscan->scan.scanrelid = rel->relid;
 	cscan->scan.plan.targetlist = tlist;
+	cscan->flags |= CUSTOMPATH_SUPPORT_PROJECTION;
+
 	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
 
 	return &(cscan->scan.plan);
@@ -200,6 +216,15 @@ PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 
 	index = PGrnLookupIndex(customScanState->ss.ss_currentRelation, ERROR);
 	sourcesTable = PGrnLookupSourcesTable(index, ERROR);
+
+	{
+		// debug
+		ListCell *last_cell =
+			list_nth_cell(node->ss.ps.plan->targetlist,
+						  node->ss.ps.plan->targetlist->length - 1);
+		TargetEntry *tle = lfirst_node(TargetEntry, last_cell);
+		state->debugFuncExpr = (FuncExpr *) tle->expr;
+	}
 
 	{
 		ScanKeyData scankey;
@@ -276,6 +301,10 @@ PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 			Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
 			state->column = PGrnLookupColumn(
 				state->searched, NameStr(attr->attname), ERROR);
+			state->scoreAccessor = grn_obj_column(ctx,
+												  state->searched,
+												  GRN_COLUMN_NAME_SCORE,
+												  GRN_COLUMN_NAME_SCORE_LEN);
 			state->columTypeId = attr->atttypid;
 		}
 	}
@@ -307,6 +336,22 @@ PGrnExecCustomScan(CustomScanState *node)
 		grn_obj_get_value(ctx, state->column, id, &value);
 		slot->tts_values[0] = PGrnConvertToDatum(&value, state->columTypeId);
 		slot->tts_isnull[0] = false;
+
+		GRN_BULK_REWIND(&value);
+		grn_obj_get_value(ctx, state->scoreAccessor, id, &value);
+		slot->tts_values[1] = PGrnConvertToDatum(&value, FLOAT8OID);
+		slot->tts_isnull[1] = false;
+
+		{
+			ExprContext *econtext = node->ss.ps.ps_ExprContext;
+			ExprState *exprstate =
+				ExecInitExpr((Expr *) state->debugFuncExpr, NULL);
+			bool isNull = false;
+			ResetExprContext(econtext);
+			slot->tts_values[2] = ExecEvalExpr(exprstate, econtext, &isNull);
+			slot->tts_isnull[2] = isNull;
+		}
+
 		GRN_OBJ_FIN(ctx, &value);
 
 		return ExecStoreVirtualTuple(slot);
@@ -323,6 +368,9 @@ static void
 PGrnEndCustomScan(CustomScanState *node)
 {
 	PGrnScanState *state = (PGrnScanState *) node;
+	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	state->debugFuncExpr = NULL;
+
 	PGrnSearchDataFree(&(state->data));
 	if (state->searched)
 	{
@@ -331,7 +379,9 @@ PGrnEndCustomScan(CustomScanState *node)
 	}
 	grn_table_cursor_close(ctx, state->cursor);
 	grn_obj_unlink(ctx, state->column);
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	state->column = NULL;
+	grn_obj_unlink(ctx, state->scoreAccessor);
+	state->scoreAccessor = NULL;
 }
 
 static void

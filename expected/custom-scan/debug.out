@@ -1,22 +1,25 @@
 /* Temporary test to be used during implementation of a custom scan. */
 CREATE TABLE memos (content text);
 CREATE INDEX memos_content ON memos USING pgroonga (content);
-INSERT INTO memos VALUES ('PGroonga');
-INSERT INTO memos VALUES ('Groonga');
-INSERT INTO memos VALUES ('Mroonga');
+INSERT INTO memos VALUES ('PostgreSQL is a RDBMS.');
+INSERT INTO memos VALUES ('Groonga is fast full text search engine.');
+INSERT INTO memos VALUES ('PGroonga is a PostgreSQL extension that uses Groonga.');
 SET pgroonga.enable_custom_scan = on;
-EXPLAIN (COSTS OFF) SELECT * FROM memos where content &@ 'Groonga';
-               QUERY PLAN               
-----------------------------------------
+EXPLAIN (COSTS OFF) SELECT content, pgroonga_score(), concat('dummy', '-dummy')
+FROM memos where content &@~ 'PGroonga OR Groonga';
+                     QUERY PLAN                      
+-----------------------------------------------------
  Custom Scan (PGroongaScan) on memos
-   Filter: (content &@ 'Groonga'::text)
+   Filter: (content &@~ 'PGroonga OR Groonga'::text)
    PGroongaScan: DEBUG
 (3 rows)
 
-SELECT * FROM memos where content &@ 'Groonga';
- content 
----------
- Groonga
-(1 row)
+SELECT content, pgroonga_score(), concat('dummy', '-dummy')
+FROM memos where content &@~ 'PGroonga OR Groonga';
+                        content                        | pgroonga_score |   concat    
+-------------------------------------------------------+----------------+-------------
+ PGroonga is a PostgreSQL extension that uses Groonga. |              2 | dummy-dummy
+ Groonga is fast full text search engine.              |              1 | dummy-dummy
+(2 rows)
 
 DROP TABLE memos;

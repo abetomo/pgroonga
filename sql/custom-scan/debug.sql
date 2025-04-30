@@ -2,13 +2,16 @@
 
 CREATE TABLE memos (content text);
 CREATE INDEX memos_content ON memos USING pgroonga (content);
-INSERT INTO memos VALUES ('PGroonga');
-INSERT INTO memos VALUES ('Groonga');
-INSERT INTO memos VALUES ('Mroonga');
+INSERT INTO memos VALUES ('PostgreSQL is a RDBMS.');
+INSERT INTO memos VALUES ('Groonga is fast full text search engine.');
+INSERT INTO memos VALUES ('PGroonga is a PostgreSQL extension that uses Groonga.');
 
 SET pgroonga.enable_custom_scan = on;
 
-EXPLAIN (COSTS OFF) SELECT * FROM memos where content &@ 'Groonga';
-SELECT * FROM memos where content &@ 'Groonga';
+EXPLAIN (COSTS OFF) SELECT content, pgroonga_score(), concat('dummy', '-dummy')
+FROM memos where content &@~ 'PGroonga OR Groonga';
+
+SELECT content, pgroonga_score(), concat('dummy', '-dummy')
+FROM memos where content &@~ 'PGroonga OR Groonga';
 
 DROP TABLE memos;

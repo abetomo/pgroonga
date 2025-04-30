@@ -63,6 +63,14 @@ CREATE FUNCTION pgroonga_score(tableoid oid, ctid tid)
 	STRICT
 	PARALLEL SAFE;
 
+CREATE FUNCTION pgroonga_score()
+	RETURNS float8
+	AS 'MODULE_PATHNAME', 'pgroonga_score_cs'
+	LANGUAGE C
+	VOLATILE
+	STRICT
+	PARALLEL SAFE;
+
 CREATE FUNCTION pgroonga_table_name(indexName cstring)
 	RETURNS text
 	AS 'MODULE_PATHNAME', 'pgroonga_table_name'
