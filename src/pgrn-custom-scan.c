@@ -144,6 +144,9 @@ PGrnBeginCustomScan(CustomScanState *cscanstate, EState *estate, int eflags)
 static TupleTableSlot *
 PGrnExecCustomScan(CustomScanState *node)
 {
+	// If PGroonga is finalized, stop the scan.
+	if (!PGrnGroongaInitialized)
+		return NULL;
 	return NULL;
 }
 
@@ -180,4 +183,8 @@ PGrnFinalizeCustomScan(void)
 	// Disable registered functions.
 	// See also
 	// https://github.com/pgroonga/pgroonga/pull/722#discussion_r2011284556
+	//
+	// ExecCustomScan (PGrnExecCustomScan) to exit even in the process.
+	// If we notice other functions that need to be disabled, we will disable
+	// them that time.
 }
