@@ -10,12 +10,14 @@
 
 #include "pgrn-custom-scan.h"
 #include "pgrn-groonga.h"
+#include "pgrn-search.h"
 
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
 	grn_table_cursor *tableCursor;
 	grn_obj columns;
+	grn_obj *searched;
 } PGrnScanState;
 
 static bool PGrnCustomScanEnabled = false;
@@ -178,6 +180,88 @@ PGrnChooseIndex(Relation table_rel, int errorLevel)
 	return NULL;
 }
 
+static bool
+PGrnOpInOpfamily(OpExpr *opexpr, Relation index)
+{
+	for (unsigned int i = 0; i < index->rd_att->natts; i++)
+	{
+		Oid opfamily = index->rd_opfamily[i];
+		if (op_in_opfamily(opexpr->opno, opfamily))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
+									Relation index,
+									PGrnSearchData *data)
+{
+	List *quals = customScanState->ss.ps.plan->qual;
+	ListCell *cell;
+	foreach (cell, quals)
+	{
+		Expr *expr = (Expr *) lfirst(cell);
+		OpExpr *opexpr;
+		Node *left;
+		Node *right;
+		Var *column;
+		Const *value;
+
+		if (!IsA(expr, OpExpr))
+			continue;
+
+		opexpr = (OpExpr *) expr;
+		if (list_length(opexpr->args) != 2)
+			continue;
+
+		if (!PGrnOpInOpfamily(opexpr, index))
+			continue;
+
+		left = linitial(opexpr->args);
+		right = lsecond(opexpr->args);
+
+		if (nodeTag(left) == T_Var && nodeTag(right) == T_Const)
+		{
+			column = (Var *) left;
+			value = (Const *) right;
+		}
+		else if (nodeTag(left) == T_Const && nodeTag(right) == T_Var)
+		{
+			column = (Var *) right;
+			value = (Const *) left;
+		}
+		else
+		{
+			continue;
+		}
+
+		for (unsigned int i = 0; i < index->rd_att->natts; i++)
+		{
+			Oid opfamily = index->rd_opfamily[i];
+			int strategy;
+			Oid leftType;
+			Oid rightType;
+			ScanKeyData scankey;
+
+			get_op_opfamily_properties(opexpr->opno,
+									   opfamily,
+									   false,
+									   &strategy,
+									   &leftType,
+									   &rightType);
+			ScanKeyInit(&scankey,
+						column->varattno,
+						strategy,
+						opexpr->opfuncid,
+						value->constvalue);
+			PGrnSearchBuildCondition(index, &scankey, data);
+		}
+	}
+}
+
 static void
 PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -188,7 +272,7 @@ PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	Relation index =
 		PGrnChooseIndex(customScanState->ss.ss_currentRelation, ERROR);
 	grn_obj *sourcesTable = PGrnLookupSourcesTable(index, ERROR);
-	RelationClose(index);
+	PGrnSearchData searchData;
 
 	GRN_PTR_INIT(&(state->columns), GRN_OBJ_VECTOR, GRN_ID_NIL);
 	for (int i = 0; i < tupdesc->natts; i++)
@@ -198,8 +282,38 @@ PGrnBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 			PGrnLookupColumn(sourcesTable, NameStr(attr->attname), ERROR);
 		GRN_PTR_PUT(ctx, &(state->columns), column);
 	}
-	state->tableCursor = grn_table_cursor_open(
-		ctx, sourcesTable, NULL, 0, NULL, 0, 0, -1, GRN_CURSOR_ASCENDING);
+
+	PGrnSearchDataInit(&searchData, index, sourcesTable);
+	PGrnSearchBuildCustomScanConditions(node, index, &searchData);
+
+	if (!searchData.isEmptyCondition)
+	{
+		grn_table_selector *table_selector = grn_table_selector_open(
+			ctx, sourcesTable, searchData.expression, GRN_OP_OR);
+
+		state->searched =
+			grn_table_create(ctx,
+							 NULL,
+							 0,
+							 NULL,
+							 GRN_OBJ_TABLE_HASH_KEY | GRN_OBJ_WITH_SUBREC,
+							 sourcesTable,
+							 0);
+		grn_table_selector_select(ctx, table_selector, state->searched);
+		grn_table_selector_close(ctx, table_selector);
+		state->tableCursor = grn_table_cursor_open(ctx,
+												   state->searched,
+												   NULL,
+												   0,
+												   NULL,
+												   0,
+												   0,
+												   -1,
+												   GRN_CURSOR_ASCENDING);
+	}
+
+	RelationClose(index);
+	PGrnSearchDataFree(&searchData);
 }
 
 static TupleTableSlot *
@@ -258,6 +372,12 @@ PGrnEndCustomScan(CustomScanState *node)
 		grn_obj_unlink(ctx, column);
 	}
 	GRN_OBJ_FIN(ctx, &(state->columns));
+
+	if (state->searched)
+	{
+		grn_obj_close(ctx, state->searched);
+		state->searched = NULL;
+	}
 }
 
 static void
