@@ -4,6 +4,7 @@
 #	include <commands/explain_format.h>
 #endif
 #include <nodes/extensible.h>
+#include <nodes/nodeFuncs.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <optimizer/restrictinfo.h>
@@ -351,22 +352,46 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 
 	{
 		TupleTableSlot *slot = customScanState->ss.ps.ps_ResultTupleSlot;
+		unsigned int i = 0;
+		ListCell *cell;
 
 		ExecClearTuple(slot);
-		for (unsigned int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
+		// We might add state->targetList instead of ss.ps.plan->targetlist.
+		foreach (cell, customScanState->ss.ps.plan->targetlist)
 		{
-			Form_pg_attribute attr =
-				TupleDescAttr(slot->tts_tupleDescriptor, i);
+			TargetEntry *entry = (TargetEntry *) lfirst(cell);
 			grn_obj *column = GRN_PTR_VALUE_AT(&(state->columns), i);
 			GRN_BULK_REWIND(&(state->columnValue));
 			grn_obj_get_value(ctx, column, id, &(state->columnValue));
-			slot->tts_values[i] =
-				PGrnConvertToDatum(&(state->columnValue), attr->atttypid);
-			// todo
-			// If there are nullable columns, do not custom scan.
-			// See also
-			// https://github.com/pgroonga/pgroonga/pull/742#discussion_r2107937927
-			slot->tts_isnull[i] = false;
+
+			if (IsA(entry->expr, Var))
+			{
+				Var *var = (Var *) entry->expr;
+				if (var->varattno == TableOidAttributeNumber)
+				{
+					Oid tableOid = RelationGetRelid(
+						customScanState->ss.ss_currentRelation);
+					slot->tts_values[i] = ObjectIdGetDatum(tableOid);
+					slot->tts_isnull[i] = false;
+				}
+				else if (var->varattno == SelfItemPointerAttributeNumber)
+				{
+					// todo Set the value.
+					slot->tts_isnull[i] = true;
+				}
+				else
+				{
+					Oid typeId = exprType((Node *) entry->expr);
+					slot->tts_values[i] =
+						PGrnConvertToDatum(&(state->columnValue), typeId);
+					// todo
+					// If there are nullable columns, do not custom scan.
+					// See also
+					// https://github.com/pgroonga/pgroonga/pull/742#discussion_r2107937927
+					slot->tts_isnull[i] = false;
+				}
+			}
+			i++;
 		}
 		return ExecStoreVirtualTuple(slot);
 	}
