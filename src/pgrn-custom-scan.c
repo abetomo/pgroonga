@@ -99,8 +99,71 @@ PGrnCustomScanDisable(void)
 	PGrnCustomScanEnabled = false;
 }
 
+static int
+PGrnGetIndexColumnAttributeNumber(Relation index, int tableAttnum)
+{
+	IndexInfo *indexInfo = BuildIndexInfo(index);
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	{
+		if (indexInfo->ii_IndexAttrNumbers[i] == tableAttnum)
+		{
+			pfree(indexInfo);
+			return i + 1;
+		}
+	}
+	pfree(indexInfo);
+	return 0;
+}
+
+static bool
+_PGrnIndexContainColumn(Relation index, List *quals)
+{
+	ListCell *cell;
+	if (quals == NIL)
+		return true;
+
+	foreach (cell, quals)
+	{
+		Expr *expr = (Expr *) lfirst(cell);
+		OpExpr *opexpr;
+		Node *left;
+		Node *right;
+		Var *column;
+
+		if (!IsA(expr, OpExpr))
+		{
+			continue;
+		}
+
+		opexpr = (OpExpr *) expr;
+		if (list_length(opexpr->args) != 2)
+		{
+			continue;
+		}
+
+		left = linitial(opexpr->args);
+		right = lsecond(opexpr->args);
+
+		if (nodeTag(left) == T_Var && nodeTag(right) == T_Const)
+		{
+			column = (Var *) left;
+		}
+		else if (nodeTag(left) == T_Const && nodeTag(right) == T_Var)
+		{
+			column = (Var *) right;
+		}
+		else
+		{
+			continue;
+		}
+
+		return PGrnGetIndexColumnAttributeNumber(index, column->varattno) != 0;
+	}
+	return false;
+}
+
 static Relation
-PGrnChooseIndex(Relation table)
+PGrnChooseIndex(Relation table, List *quals)
 {
 	// todo: Support pgroonga_condition() index specification.
 	// todo: Implementation of the logic for choosing which index to use.
@@ -121,7 +184,9 @@ PGrnChooseIndex(Relation table)
 			RelationClose(index);
 			continue;
 		}
-		return index;
+		if (_PGrnIndexContainColumn(index, quals))
+			return index;
+		RelationClose(index);
 	}
 	return NULL;
 }
@@ -154,7 +219,7 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 		Relation table = relation_open(rte->relid, AccessShareLock);
 		if (table)
 		{
-			Relation index = PGrnChooseIndex(table);
+			Relation index = PGrnChooseIndex(table, NIL);
 			relation_close(table, AccessShareLock);
 			if (!index)
 			{
@@ -261,22 +326,6 @@ PGrnSetTargetColumns(CustomScanState *customScanState,
 	}
 }
 
-static int
-PGrnGetIndexColumnAttributeNumber(Relation index, int tableAttnum)
-{
-	IndexInfo *indexInfo = BuildIndexInfo(index);
-	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
-	{
-		if (indexInfo->ii_IndexAttrNumbers[i] == tableAttnum)
-		{
-			pfree(indexInfo);
-			return i + 1;
-		}
-	}
-	pfree(indexInfo);
-	return 0;
-}
-
 static void
 PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 									Relation index)
@@ -373,7 +422,8 @@ PGrnBeginCustomScan(CustomScanState *customScanState,
 					int eflags)
 {
 	PGrnScanState *state = (PGrnScanState *) customScanState;
-	Relation index = PGrnChooseIndex(customScanState->ss.ss_currentRelation);
+	Relation index = PGrnChooseIndex(customScanState->ss.ss_currentRelation,
+									 customScanState->ss.ps.plan->qual);
 	grn_obj *sourcesTable;
 
 	if (!index)
