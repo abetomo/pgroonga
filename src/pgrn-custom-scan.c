@@ -17,10 +17,16 @@
 
 #include "pgroonga.h"
 
+#include "pgrn-condition.h"
 #include "pgrn-ctid.h"
 #include "pgrn-custom-scan.h"
 #include "pgrn-groonga.h"
+#include "pgrn-pg.h"
 #include "pgrn-search.h"
+
+#include <catalog/pg_type.h>
+#include <utils/builtins.h>
+#include <utils/syscache.h>
 
 typedef struct PGrnScanState
 {
@@ -162,6 +168,80 @@ _PGrnIndexContainColumn(Relation index, List *quals)
 	return false;
 }
 
+static bool
+PGrnIsPGrnConditionType(Const *value)
+{
+	HeapTuple tuple =
+		SearchSysCache1(TYPEOID, ObjectIdGetDatum(value->consttype));
+	Form_pg_type type_form = (Form_pg_type) GETSTRUCT(tuple);
+	bool isPGrnConditionType =
+		(strcmp(NameStr(type_form->typname), "pgroonga_condition") == 0);
+	ReleaseSysCache(tuple);
+	return isPGrnConditionType;
+}
+
+static Relation
+PGrnChooseIndexInPGrnCondition(List *quals)
+{
+	const char *tag = "pgroonga: [custom-scan][build-conditions]";
+	ListCell *cell;
+	foreach (cell, quals)
+	{
+		Expr *expr = (Expr *) lfirst(cell);
+		OpExpr *opexpr;
+		Node *left;
+		Node *right;
+		Const *value;
+
+		if (!IsA(expr, OpExpr))
+		{
+			elog(DEBUG1, "%s node type is not OpExpr <%d>", tag, nodeTag(expr));
+			continue;
+		}
+
+		opexpr = (OpExpr *) expr;
+		if (list_length(opexpr->args) != 2)
+		{
+			elog(DEBUG1,
+				 "%s The number of arguments is not 2. <%d>",
+				 tag,
+				 list_length(opexpr->args));
+			continue;
+		}
+
+		left = linitial(opexpr->args);
+		right = lsecond(opexpr->args);
+
+		if (nodeTag(left) == T_Var && nodeTag(right) == T_Const)
+		{
+			value = (Const *) right;
+		}
+		else if (nodeTag(left) == T_Const && nodeTag(right) == T_Var)
+		{
+			value = (Const *) left;
+		}
+		else
+		{
+			elog(DEBUG1,
+				 "%s The arguments are not a pair of Var and Const. <%d op %d>",
+				 tag,
+				 nodeTag(left),
+				 nodeTag(right));
+			continue;
+		}
+		if (PGrnIsPGrnConditionType(value))
+		{
+			PGrnCondition condition = {0};
+			HeapTupleHeader header =
+				(HeapTupleHeader) DatumGetPointer(value->constvalue);
+			PGrnConditionDeconstruct(&condition, header);
+			return RelationIdGetRelation(
+				PGrnPGIndexNameToID(text_to_cstring(condition.indexName)));
+		}
+	}
+	return NULL;
+}
+
 static Relation
 PGrnChooseIndex(Relation table, List *quals)
 {
@@ -169,16 +249,21 @@ PGrnChooseIndex(Relation table, List *quals)
 	// todo: Implementation of the logic for choosing which index to use.
 	ListCell *cell;
 	List *indexes;
+	Relation index;
 
 	if (!table)
 		return NULL;
+
+	index = PGrnChooseIndexInPGrnCondition(quals);
+	if (index)
+		return index;
 
 	indexes = RelationGetIndexList(table);
 	foreach (cell, indexes)
 	{
 		Oid indexId = lfirst_oid(cell);
 
-		Relation index = RelationIdGetRelation(indexId);
+		index = RelationIdGetRelation(indexId);
 		if (!PGrnIndexIsPGroonga(index))
 		{
 			RelationClose(index);
@@ -189,6 +274,19 @@ PGrnChooseIndex(Relation table, List *quals)
 		RelationClose(index);
 	}
 	return NULL;
+}
+
+static List *
+PGrnConvertExprList(List *baserestrictinfo)
+{
+	List *exprList = NIL;
+	ListCell *cell;
+	foreach (cell, baserestrictinfo)
+	{
+		RestrictInfo *info = (RestrictInfo *) lfirst(cell);
+		exprList = lappend(exprList, info->clause);
+	}
+	return exprList;
 }
 
 static void
@@ -219,7 +317,8 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 		Relation table = relation_open(rte->relid, AccessShareLock);
 		if (table)
 		{
-			Relation index = PGrnChooseIndex(table, NIL);
+			Relation index = PGrnChooseIndex(
+				table, PGrnConvertExprList(rel->baserestrictinfo));
 			relation_close(table, AccessShareLock);
 			if (!index)
 			{
@@ -332,7 +431,6 @@ PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 {
 	PGrnScanState *state = (PGrnScanState *) customScanState;
 	const char *tag = "pgroonga: [custom-scan][build-conditions]";
-
 	List *quals = customScanState->ss.ps.plan->qual;
 	ListCell *cell;
 	foreach (cell, quals)
