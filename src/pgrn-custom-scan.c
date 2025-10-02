@@ -133,6 +133,15 @@ PGrnGetIndexColumnAttributeNumber(IndexInfo *indexInfo, int tableAttnum)
 	return 0;
 }
 
+static int
+PGrnScanKeyFlags(Expr *expr)
+{
+	int flags = 0;
+	if (IsA(expr, ScalarArrayOpExpr))
+		flags |= SK_SEARCHARRAY;
+	return flags;
+}
+
 static void
 PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 {
@@ -151,9 +160,9 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 		Var *column;
 		Const *value;
 
-		if (!IsA(expr, OpExpr))
+		if (!IsA(expr, OpExpr) && !IsA(expr, ScalarArrayOpExpr))
 		{
-			elog(DEBUG1, "%s node type is not OpExpr <%d>", tag, nodeTag(expr));
+			elog(DEBUG1, "%s Unsupported Expr <%d>", tag, nodeTag(expr));
 			continue;
 		}
 
@@ -213,11 +222,14 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 									   &strategy,
 									   &leftType,
 									   &rightType);
-			ScanKeyInit(&(data->scanKeys[(data->nScanKeys)++]),
-						attributeNumber,
-						strategy,
-						opexpr->opfuncid,
-						value->constvalue);
+			ScanKeyEntryInitialize(&(data->scanKeys[(data->nScanKeys)++]),
+								   PGrnScanKeyFlags(expr),
+								   attributeNumber,
+								   strategy,
+								   column->vartype,
+								   exprCollation((Node *) expr),
+								   opexpr->opfuncid,
+								   value->constvalue);
 		}
 	}
 	pfree(indexInfo);
