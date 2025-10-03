@@ -33,11 +33,13 @@ typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
 	PGrnScanIndexData *scanData;
+	List *sortClauses;
 	grn_table_cursor *tableCursor;
 	grn_obj columns;
 	grn_obj columnValue;
 	PGrnSearchData searchData;
 	grn_obj *searched;
+	grn_obj *sorted;
 	grn_obj *ctidAccessor;
 	grn_obj *scoreAccessor;
 } PGrnScanState;
@@ -269,6 +271,39 @@ PGrnChooseIndex(Relation table, List *quals, PGrnScanIndexData *data)
 	return NULL;
 }
 
+static bool
+PGrnIndexContainColumn(Relation index, const char *name)
+{
+	TupleDesc tupdesc = RelationGetDescr(index);
+	for (AttrNumber i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		if (strcmp(NameStr(attr->attname), name) == 0)
+			return true;
+	}
+	return false;
+}
+
+static List *
+PGrnIndexSortClauses(Relation table, Relation index, List *sortClauses)
+{
+	List *indexSortClauses = NIL;
+	ListCell *cell;
+	foreach (cell, sortClauses)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(cell);
+		AttrNumber attnum = sgc->tleSortGroupRef;
+		Form_pg_attribute attr = TupleDescAttr(table->rd_att, attnum - 1);
+		const char *name = NameStr(attr->attname);
+		if (PGrnIndexContainColumn(index, name))
+		{
+			indexSortClauses = lappend(indexSortClauses, sgc);
+		}
+	}
+
+	return indexSortClauses;
+}
+
 static void
 PGrnSetRelPathlistHook(PlannerInfo *root,
 					   RelOptInfo *rel,
@@ -277,6 +312,7 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 {
 	CustomPath *cpath;
 	PGrnScanIndexData *scanData = NULL;
+	List *sortClauses = NIL;
 
 	if (PreviousSetRelPathlistHook)
 	{
@@ -310,6 +346,7 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 			{
 				return;
 			}
+			sortClauses = PGrnIndexSortClauses(table, index, root->parse->sortClause);
 			RelationClose(index);
 		}
 	}
@@ -318,7 +355,9 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;
 	cpath->path.pathtarget = rel->reltarget;
-	cpath->custom_private = list_make1(scanData);
+	cpath->path.pathkeys = make_pathkeys_for_sortclauses(
+		root, sortClauses, root->parse->targetList);
+	cpath->custom_private = list_make2(scanData, sortClauses);
 
 #if (PG_VERSION_NUM >= 150000)
 	cpath->flags |= CUSTOMPATH_SUPPORT_PROJECTION;
@@ -368,23 +407,12 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 	GRN_VOID_INIT(&(state->columnValue));
 	memset(&(state->searchData), 0, sizeof(state->searchData));
 	state->searched = NULL;
+	state->sorted = NULL;
 	state->scoreAccessor = NULL;
 	state->scanData = linitial(cscan->custom_private);
+	state->sortClauses = lsecond(cscan->custom_private);
 
 	return (Node *) &(state->parent);
-}
-
-static bool
-PGrnIndexContainColumn(Relation index, const char *name)
-{
-	TupleDesc tupdesc = RelationGetDescr(index);
-	for (AttrNumber i = 0; i < tupdesc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-		if (strcmp(NameStr(attr->attname), name) == 0)
-			return true;
-	}
-	return false;
 }
 
 static void
@@ -431,6 +459,38 @@ PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 }
 
 static void
+PGrnCustomScanSort(CustomScanState *customScanState, List *sortClauses)
+{
+	PGrnScanState *state = (PGrnScanState *) customScanState;
+	Relation table = customScanState->ss.ss_currentRelation;
+	int nSortKeys = list_length(sortClauses);
+	grn_table_sort_key *sortKeys =
+		(grn_table_sort_key *) palloc(sizeof(grn_table_sort_key) * nSortKeys);
+	ListCell *cell;
+	unsigned int i = 0;
+	foreach (cell, sortClauses)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(cell);
+		AttrNumber attnum = sgc->tleSortGroupRef;
+		Form_pg_attribute attr = TupleDescAttr(table->rd_att, attnum - 1);
+		const char *name = NameStr(attr->attname);
+		sortKeys[i].key = grn_obj_column(ctx, state->searched, name, strlen(name));
+		sortKeys[i].flags =
+			sgc->reverse_sort ? GRN_TABLE_SORT_DESC : GRN_TABLE_SORT_ASC;
+		i++;
+	}
+
+	state->sorted = grn_table_create(
+		ctx, NULL, 0, NULL, GRN_OBJ_TABLE_NO_KEY, NULL, state->searched);
+	grn_table_sort(ctx, state->searched, 0, -1, state->sorted, sortKeys, nSortKeys);
+
+	for (i = 0; i < nSortKeys; i++) {
+		grn_obj_close(ctx, sortKeys[i].key);
+	}
+	pfree(sortKeys);
+}
+
+static void
 PGrnBeginCustomScan(CustomScanState *customScanState,
 					EState *estate,
 					int eflags)
@@ -445,6 +505,7 @@ PGrnBeginCustomScan(CustomScanState *customScanState,
 
 	if (!state->searchData.isEmptyCondition)
 	{
+		grn_obj *targetTable = NULL;
 		grn_table_selector *table_selector = grn_table_selector_open(
 			ctx, sourcesTable, state->searchData.expression, GRN_OP_OR);
 		grn_table_selector_set_fuzzy_max_distance_ratio(
@@ -460,35 +521,33 @@ PGrnBeginCustomScan(CustomScanState *customScanState,
 							 0);
 		grn_table_selector_select(ctx, table_selector, state->searched);
 		grn_table_selector_close(ctx, table_selector);
-		PGrnSetTargetColumns(customScanState, index, state->searched);
-		state->tableCursor = grn_table_cursor_open(ctx,
-												   state->searched,
-												   NULL,
-												   0,
-												   NULL,
-												   0,
-												   0,
-												   -1,
-												   GRN_CURSOR_ASCENDING);
+
+		if (state->sortClauses)
+			PGrnCustomScanSort(customScanState, state->sortClauses);
+
+		if (state->sorted)
+			targetTable = state->sorted;
+		else
+			targetTable = state->searched;
+
+		PGrnSetTargetColumns(customScanState, index, targetTable);
+		state->tableCursor = grn_table_cursor_open(
+			ctx, targetTable, NULL, 0, NULL, 0, 0, -1, GRN_CURSOR_ASCENDING);
 		if (sourcesTable->header.type == GRN_TABLE_NO_KEY)
 		{
 			state->ctidAccessor =
 				grn_obj_column(ctx,
-							   state->searched,
+							   targetTable,
 							   PGrnSourcesCtidColumnName,
 							   PGrnSourcesCtidColumnNameLength);
 		}
 		else
 		{
-			state->ctidAccessor = grn_obj_column(ctx,
-												 state->searched,
-												 GRN_COLUMN_NAME_KEY,
-												 GRN_COLUMN_NAME_KEY_LEN);
+			state->ctidAccessor = grn_obj_column(
+				ctx, targetTable, GRN_COLUMN_NAME_KEY, GRN_COLUMN_NAME_KEY_LEN);
 		}
-		state->scoreAccessor = grn_obj_column(ctx,
-											  state->searched,
-											  GRN_COLUMN_NAME_SCORE,
-											  GRN_COLUMN_NAME_SCORE_LEN);
+		state->scoreAccessor = grn_obj_column(
+			ctx, targetTable, GRN_COLUMN_NAME_SCORE, GRN_COLUMN_NAME_SCORE_LEN);
 	}
 
 	RelationClose(index);
@@ -670,6 +729,11 @@ PGrnEndCustomScan(CustomScanState *customScanState)
 	{
 		grn_obj_close(ctx, state->searched);
 		state->searched = NULL;
+	}
+	if (state->sorted)
+	{
+		grn_obj_close(ctx, state->sorted);
+		state->sorted = NULL;
 	}
 	if (state->scoreAccessor)
 	{
