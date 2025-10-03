@@ -27,12 +27,14 @@ typedef struct PGrnScanIndexData
 	Oid indexOID;
 	ScanKeyData *scanKeys;
 	int nScanKeys;
+	List *otherQuals;
 } PGrnScanIndexData;
 
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
 	PGrnScanIndexData *scanData;
+	ExprState *otherExprState;
 	grn_table_cursor *tableCursor;
 	grn_obj columns;
 	grn_obj columnValue;
@@ -153,6 +155,7 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 
 		if (!IsA(expr, OpExpr))
 		{
+			data->otherQuals = lappend(data->otherQuals, expr);
 			elog(DEBUG1, "%s node type is not OpExpr <%d>", tag, nodeTag(expr));
 			continue;
 		}
@@ -160,6 +163,7 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 		opexpr = (OpExpr *) expr;
 		if (list_length(opexpr->args) != 2)
 		{
+			data->otherQuals = lappend(data->otherQuals, expr);
 			elog(DEBUG1,
 				 "%s The number of arguments is not 2. <%d>",
 				 tag,
@@ -182,6 +186,7 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 		}
 		else
 		{
+			data->otherQuals = lappend(data->otherQuals, expr);
 			elog(DEBUG1,
 				 "%s The arguments are not a pair of Var and Const. <%d op %d>",
 				 tag,
@@ -199,6 +204,7 @@ PGrnScanIndexDataInit(Relation index, List *quals, PGrnScanIndexData *data)
 				PGrnGetIndexColumnAttributeNumber(indexInfo, column->varattno);
 			if (attributeNumber == 0)
 			{
+				data->otherQuals = lappend(data->otherQuals, expr);
 				ereport(DEBUG1,
 						(errcode(ERRCODE_UNDEFINED_COLUMN),
 						 errmsg("pgroonga: %s "
@@ -248,6 +254,7 @@ PGrnChooseIndex(Relation table, List *quals, PGrnScanIndexData *data)
 		PGrnScanIndexDataInit(index, quals, data);
 		if (data->nScanKeys == 0)
 		{
+			data->otherQuals = NIL;
 			RelationClose(index);
 			continue;
 		}
@@ -292,6 +299,7 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 			scanData = palloc(sizeof(PGrnScanIndexData));
 			scanData->scanKeys =
 				palloc(sizeof(ScanKeyData) * list_length(quals));
+			scanData->otherQuals = NIL;
 			index = PGrnChooseIndex(table, quals, scanData);
 			relation_close(table, AccessShareLock);
 			if (!index)
@@ -358,6 +366,7 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 	state->searched = NULL;
 	state->scoreAccessor = NULL;
 	state->scanData = linitial(cscan->custom_private);
+	state->otherExprState = NULL;
 
 	return (Node *) &(state->parent);
 }
@@ -482,6 +491,18 @@ PGrnBeginCustomScan(CustomScanState *customScanState,
 	RelationClose(index);
 	PGrnSearchDataFree(&(state->searchData));
 	memset(&(state->searchData), 0, sizeof(state->searchData));
+
+	if (state->scanData->otherQuals != NIL)
+	{
+		// todo
+		// We support complex conditions.
+		// Currently, only simple AND conditions are supported.
+		BoolExpr *andExpr = makeNode(BoolExpr);
+		andExpr->boolop = AND_EXPR;
+		andExpr->args = state->scanData->otherQuals;
+		state->otherExprState =
+			ExecInitExpr((Expr *) andExpr, &(customScanState->ss.ps));
+	}
 }
 
 static TupleTableSlot *
@@ -490,6 +511,7 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 	const char *tag = "pgroonga: [custom-scan][exec]";
 	PGrnScanState *state = (PGrnScanState *) customScanState;
 	Relation table = customScanState->ss.ss_currentRelation;
+	ExprContext *econtext = customScanState->ss.ps.ps_ExprContext;
 	ItemPointerData ctid;
 	grn_id id;
 	uint64_t packedCtid;
@@ -587,8 +609,6 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 				}
 				else
 				{
-					ExprContext *econtext =
-						customScanState->ss.ps.ps_ExprContext;
 					// todo
 					// Initialization in BeginCustomScan.
 					// See also
@@ -603,7 +623,15 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 			}
 			ttsIndex++;
 		}
-		return ExecStoreVirtualTuple(slot);
+
+		{
+			econtext->ecxt_scantuple = slot;
+			if (!state->otherExprState ||
+				ExecQual(state->otherExprState, econtext))
+				return ExecStoreVirtualTuple(slot);
+			else
+				return NULL;
+		}
 	}
 }
 
@@ -620,6 +648,7 @@ PGrnEndCustomScan(CustomScanState *customScanState)
 	unsigned int nTargetColumns;
 
 	ExecClearTuple(customScanState->ss.ps.ps_ResultTupleSlot);
+	state->otherExprState = NULL;
 	if (state->scanData)
 	{
 		if (state->scanData->scanKeys)
