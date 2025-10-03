@@ -37,10 +37,6 @@ $$;
 
 SET pgroonga.enable_custom_scan = on;
 
-/*
- * todo Support for parallel scans.
- * Supporting parallel scans should change the results of EXPALIN.
- */
 EXPLAIN (COSTS OFF)
 SELECT count(id)
   FROM memos
