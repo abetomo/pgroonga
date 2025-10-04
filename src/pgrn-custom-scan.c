@@ -388,8 +388,14 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;
 	cpath->path.pathtarget = rel->reltarget;
-	cpath->path.parallel_aware = true;
-	cpath->path.parallel_safe = true;
+
+	// todo
+	if (rel->pages > 100)
+	{
+		cpath->path.parallel_aware = true;
+		cpath->path.parallel_safe = true;
+	}
+
 	cpath->custom_private = privateData;
 
 #if (PG_VERSION_NUM >= 150000)

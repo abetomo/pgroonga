@@ -35,20 +35,17 @@ EXPLAIN (COSTS OFF)
 SELECT count(id)
   FROM memos
  WHERE content &@~ 'data 9*';
-                                     QUERY PLAN                                     
-------------------------------------------------------------------------------------
- Gather
-   Workers Planned: 1
-   Single Copy: true
-   ->  Aggregate
-         ->  Append
-               ->  Parallel Custom Scan (PGroongaScan) on memos_0_10000 memos_1
-                     Filter: (content &@~ 'data 9*'::text)
-               ->  Parallel Custom Scan (PGroongaScan) on memos_10000_20000 memos_2
-                     Filter: (content &@~ 'data 9*'::text)
-               ->  Parallel Custom Scan (PGroongaScan) on memos_20000_30000 memos_3
-                     Filter: (content &@~ 'data 9*'::text)
-(11 rows)
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Custom Scan (PGroongaScan) on memos_0_10000 memos_1
+               Filter: (content &@~ 'data 9*'::text)
+         ->  Custom Scan (PGroongaScan) on memos_10000_20000 memos_2
+               Filter: (content &@~ 'data 9*'::text)
+         ->  Custom Scan (PGroongaScan) on memos_20000_30000 memos_3
+               Filter: (content &@~ 'data 9*'::text)
+(8 rows)
 
 SELECT count(id)
   FROM memos
