@@ -346,7 +346,8 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 			{
 				return;
 			}
-			sortClauses = PGrnIndexSortClauses(table, index, root->parse->sortClause);
+			sortClauses =
+				PGrnIndexSortClauses(table, index, root->parse->sortClause);
 			RelationClose(index);
 		}
 	}
@@ -357,7 +358,7 @@ PGrnSetRelPathlistHook(PlannerInfo *root,
 	cpath->path.pathtarget = rel->reltarget;
 	cpath->path.pathkeys = make_pathkeys_for_sortclauses(
 		root, sortClauses, root->parse->targetList);
-	cpath->custom_private = list_make2(scanData, sortClauses);
+	cpath->custom_private = list_make2(scanData, cpath->path.pathkeys);
 
 #if (PG_VERSION_NUM >= 150000)
 	cpath->flags |= CUSTOMPATH_SUPPORT_PROJECTION;
@@ -470,21 +471,33 @@ PGrnCustomScanSort(CustomScanState *customScanState, List *sortClauses)
 	unsigned int i = 0;
 	foreach (cell, sortClauses)
 	{
-		SortGroupClause *sgc = (SortGroupClause *) lfirst(cell);
-		AttrNumber attnum = sgc->tleSortGroupRef;
-		Form_pg_attribute attr = TupleDescAttr(table->rd_att, attnum - 1);
-		const char *name = NameStr(attr->attname);
-		sortKeys[i].key = grn_obj_column(ctx, state->searched, name, strlen(name));
-		sortKeys[i].flags =
-			sgc->reverse_sort ? GRN_TABLE_SORT_DESC : GRN_TABLE_SORT_ASC;
-		i++;
+		PathKey *pathKey = (PathKey *) lfirst(cell);
+		EquivalenceMember *member = linitial(pathKey->pk_eclass->ec_members);
+		Expr *expr = (Expr *) (member->em_expr);
+		if (IsA(expr, Var))
+		{
+			// Support only simple sorting by columns.
+			Var *var = (Var *) expr;
+			Form_pg_attribute attr =
+				TupleDescAttr(table->rd_att, var->varattno - 1);
+			const char *name = NameStr(attr->attname);
+			sortKeys[i].key =
+				grn_obj_column(ctx, state->searched, name, strlen(name));
+			if (pathKey->pk_cmptype == COMPARE_LT)
+				sortKeys[i].flags = GRN_TABLE_SORT_ASC;
+			else if (pathKey->pk_cmptype == COMPARE_GT)
+				sortKeys[i].flags = GRN_TABLE_SORT_DESC;
+			i++;
+		}
 	}
 
 	state->sorted = grn_table_create(
 		ctx, NULL, 0, NULL, GRN_OBJ_TABLE_NO_KEY, NULL, state->searched);
-	grn_table_sort(ctx, state->searched, 0, -1, state->sorted, sortKeys, nSortKeys);
+	grn_table_sort(
+		ctx, state->searched, 0, -1, state->sorted, sortKeys, nSortKeys);
 
-	for (i = 0; i < nSortKeys; i++) {
+	for (i = 0; i < nSortKeys; i++)
+	{
 		grn_obj_close(ctx, sortKeys[i].key);
 	}
 	pfree(sortKeys);
