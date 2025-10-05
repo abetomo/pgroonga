@@ -381,6 +381,12 @@ PGrnTableColumnName(Relation table, Var *var)
 	return NameStr(attr->attname);
 }
 
+static bool
+PGrnFuncExprIsPgroongaScore(FuncExpr *expr)
+{
+	return strcmp(get_func_name(expr->funcid), "pgroonga_score") == 0;
+}
+
 static List *
 PGrnIndexSortClauses(Relation table, Relation index, PlannerInfo *plannerInfo)
 {
@@ -400,6 +406,11 @@ PGrnIndexSortClauses(Relation table, Relation index, PlannerInfo *plannerInfo)
 			{
 				indexSortClauses = lappend(indexSortClauses, sortGroupClause);
 			}
+		}
+		else if (IsA(expr, FuncExpr))
+		{
+			if (PGrnFuncExprIsPgroongaScore((FuncExpr *) expr))
+				indexSortClauses = lappend(indexSortClauses, sortGroupClause);
 		}
 	}
 	return indexSortClauses;
@@ -623,31 +634,40 @@ PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 static void
 PGrnCustomScanSort(CustomScanState *customScanState)
 {
+	const char *tag = "pgroonga: [custom-scan][sort]";
 	PGrnScanState *state = (PGrnScanState *) customScanState;
 	Relation table = customScanState->ss.ss_currentRelation;
-	int nSortKeys = list_length(state->pathKeys);
+	int nPathKeys = list_length(state->pathKeys);
 	grn_table_sort_key *sortKeys =
-		(grn_table_sort_key *) palloc(sizeof(grn_table_sort_key) * nSortKeys);
+		(grn_table_sort_key *) palloc(sizeof(grn_table_sort_key) * nPathKeys);
 	ListCell *cell;
-	unsigned int i = 0;
+	unsigned int nSortKeys = 0;
 	foreach (cell, state->pathKeys)
 	{
 		PathKey *pathKey = (PathKey *) lfirst(cell);
 		EquivalenceMember *member = linitial(pathKey->pk_eclass->ec_members);
 		Expr *expr = (Expr *) (member->em_expr);
+		const char *name = NULL;
 		if (IsA(expr, Var))
+			name = PGrnTableColumnName(table, (Var *) expr);
+		else if (IsA(expr, FuncExpr) &&
+				 PGrnFuncExprIsPgroongaScore((FuncExpr *) expr))
+			name = GRN_COLUMN_NAME_SCORE;
+		else
 		{
-			// Support only simple sorting by columns.
-			Var *var = (Var *) expr;
-			const char *name = PGrnTableColumnName(table, var);
-			sortKeys[i].key =
-				grn_obj_column(ctx, state->searched, name, strlen(name));
-			if (pathKey->pk_cmptype == COMPARE_LT)
-				sortKeys[i].flags = GRN_TABLE_SORT_ASC;
-			else if (pathKey->pk_cmptype == COMPARE_GT)
-				sortKeys[i].flags = GRN_TABLE_SORT_DESC;
-			i++;
+			char *pathKeyStr = nodeToString(pathKey);
+			elog(DEBUG1, "%s It is an invalid pathkey <%s>", tag, pathKeyStr);
+			pfree(pathKeyStr);
+			continue;
 		}
+
+		sortKeys[nSortKeys].key =
+			grn_obj_column(ctx, state->searched, name, strlen(name));
+		if (pathKey->pk_cmptype == COMPARE_LT)
+			sortKeys[nSortKeys].flags = GRN_TABLE_SORT_ASC;
+		else if (pathKey->pk_cmptype == COMPARE_GT)
+			sortKeys[nSortKeys].flags = GRN_TABLE_SORT_DESC;
+		nSortKeys++;
 	}
 
 	state->sorted = grn_table_create(
@@ -655,7 +675,7 @@ PGrnCustomScanSort(CustomScanState *customScanState)
 	grn_table_sort(
 		ctx, state->searched, 0, -1, state->sorted, sortKeys, nSortKeys);
 
-	for (i = 0; i < nSortKeys; i++)
+	for (unsigned int i = 0; i < nSortKeys; i++)
 		grn_obj_close(ctx, sortKeys[i].key);
 	pfree(sortKeys);
 }
@@ -812,9 +832,7 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 			}
 			else if (IsA(entry->expr, FuncExpr))
 			{
-				FuncExpr *funcExpr = (FuncExpr *) (entry->expr);
-				if (strcmp(get_func_name(funcExpr->funcid), "pgroonga_score") ==
-					0)
+				if (PGrnFuncExprIsPgroongaScore((FuncExpr *) (entry->expr)))
 				{
 					// todo
 					// Reject this function if the argument isn't
@@ -833,7 +851,7 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 					// Initialization in BeginCustomScan.
 					// See also
 					// https://github.com/pgroonga/pgroonga/pull/783/files#r2374165154
-					ExprState *state = ExecInitExpr((Expr *) funcExpr, NULL);
+					ExprState *state = ExecInitExpr(entry->expr, NULL);
 					bool isNull = false;
 					ResetExprContext(econtext);
 					slot->tts_values[ttsIndex] =
