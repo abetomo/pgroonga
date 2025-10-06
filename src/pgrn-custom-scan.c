@@ -619,6 +619,7 @@ static void
 PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 									Relation index)
 {
+	const char *tag = "[custom-scan][build-conditions]";
 	PGrnScanState *state = (PGrnScanState *) customScanState;
 	ListCell *cell;
 	foreach (cell, state->scanKeySources)
@@ -644,6 +645,21 @@ PGrnSearchBuildCustomScanConditions(CustomScanState *customScanState,
 							   value->constvalue);
 
 		PGrnSearchBuildCondition(index, &key, &(state->searchData));
+
+		if (state->searchData.isEmptyCondition)
+			return;
+
+		switch (strategy)
+		{
+		case PGrnNotPrefixInStrategyV2Number:
+			break;
+		default:
+			if (state->searchData.nExpressions > 0)
+				PGrnExprAppendOp(
+					state->searchData.expression, GRN_OP_AND, 2, tag, NULL);
+			break;
+		}
+		state->searchData.nExpressions++;
 	}
 }
 
