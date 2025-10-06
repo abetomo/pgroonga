@@ -22,12 +22,13 @@
 #include "pgrn-custom-scan.h"
 #include "pgrn-groonga.h"
 #include "pgrn-search.h"
-
 typedef struct PGrnScanState
 {
 	CustomScanState parent; /* must be first field */
 	Oid indexOID;
 	List *scanKeySources;
+	List *otherQuals;
+	ExprState *otherExprState;
 	List *pathKeys;
 	grn_table_cursor *tableCursor;
 	grn_obj columns;
@@ -273,11 +274,15 @@ PGrnScanKeySourceGetValue(List *source)
 }
 
 static List *
-PGrnCustomPrivateMake(Oid indexOID, List *scanKeySources, List *pathKeys)
+PGrnCustomPrivateMake(Oid indexOID,
+					  List *scanKeySources,
+					  List *otherQuals,
+					  List *pathKeys)
 {
 	// Only a `Node` can be set to `custom_private`.
 	// See also the comments in PGrnScanKeySourceMake().
-	return list_make3(list_make1_oid(indexOID), scanKeySources, pathKeys);
+	return list_make4(
+		list_make1_oid(indexOID), scanKeySources, otherQuals, pathKeys);
 }
 
 static Oid
@@ -293,13 +298,19 @@ PGrnCustomPrivateGetScanKeySources(List *privateData)
 }
 
 static List *
-PGrnCustomPrivateGetPathKeys(List *privateData)
+PGrnCustomPrivateGetOtherQuals(List *privateData)
 {
 	return lthird(privateData);
 }
 
 static List *
-PGrnCollectScanKeySources(Relation index, List *quals)
+PGrnCustomPrivateGetPathKeys(List *privateData)
+{
+	return lfourth(privateData);
+}
+
+static List *
+PGrnCollectScanKeySources(Relation index, List *quals, List **otherQuals)
 {
 	const char *tag = "pgroonga: [custom-scan][scankey-sources][collect]";
 	IndexInfo *indexInfo = BuildIndexInfo(index);
@@ -320,6 +331,7 @@ PGrnCollectScanKeySources(Relation index, List *quals)
 					 "%s Unsupported OpExpr operator <%d>",
 					 tag,
 					 opexpr->opno);
+				*otherQuals = lappend(*otherQuals, expr);
 				continue;
 			}
 			if (list_length(opexpr->args) != 2)
@@ -328,6 +340,7 @@ PGrnCollectScanKeySources(Relation index, List *quals)
 					 "%s The number of opExpr->args is not 2. <%d>",
 					 tag,
 					 list_length(opexpr->args));
+				*otherQuals = lappend(*otherQuals, expr);
 				continue;
 			}
 
@@ -348,6 +361,7 @@ PGrnCollectScanKeySources(Relation index, List *quals)
 					 "%s Unsupported ScalarArrayOpExpr operator <%d>",
 					 tag,
 					 opexpr->opno);
+				*otherQuals = lappend(*otherQuals, expr);
 				continue;
 			}
 			if (list_length(opexpr->args) != 2)
@@ -356,6 +370,7 @@ PGrnCollectScanKeySources(Relation index, List *quals)
 					 "%s The number of scalarArrayOpExpr->args is not 2. <%d>",
 					 tag,
 					 list_length(opexpr->args));
+				*otherQuals = lappend(*otherQuals, expr);
 				continue;
 			}
 			scanKeySource = PGrnScanKeySourceMake(index,
@@ -369,11 +384,14 @@ PGrnCollectScanKeySources(Relation index, List *quals)
 		else
 		{
 			elog(DEBUG1, "%s Unsupported Expr <%d>", tag, nodeTag(expr));
+			*otherQuals = lappend(*otherQuals, expr);
 			continue;
 		}
 
 		if (scanKeySource)
 			scanKeySources = lappend(scanKeySources, scanKeySource);
+		else
+			*otherQuals = lappend(*otherQuals, expr);
 	}
 	pfree(indexInfo);
 	return scanKeySources;
@@ -440,6 +458,7 @@ PGrnChooseIndex(Relation table, PlannerInfo *plannerInfo, List *quals)
 		Oid indexOID = lfirst_oid(cell);
 		Relation index = RelationIdGetRelation(indexOID);
 		List *scanKeySources = NIL;
+		List *otherQuals = NIL;
 		List *sortClauses = NIL;
 		List *pathKeys = NIL;
 		if (!PGrnIndexIsPGroonga(index))
@@ -447,7 +466,7 @@ PGrnChooseIndex(Relation table, PlannerInfo *plannerInfo, List *quals)
 			RelationClose(index);
 			continue;
 		}
-		scanKeySources = PGrnCollectScanKeySources(index, quals);
+		scanKeySources = PGrnCollectScanKeySources(index, quals, &otherQuals);
 		sortClauses = PGrnIndexSortClauses(table, index, plannerInfo);
 		RelationClose(index);
 		if (!scanKeySources)
@@ -458,7 +477,8 @@ PGrnChooseIndex(Relation table, PlannerInfo *plannerInfo, List *quals)
 			pathKeys = make_pathkeys_for_sortclauses(
 				plannerInfo, sortClauses, plannerInfo->parse->targetList);
 		}
-		return PGrnCustomPrivateMake(indexOID, scanKeySources, pathKeys);
+		return PGrnCustomPrivateMake(
+			indexOID, scanKeySources, otherQuals, pathKeys);
 	}
 	return NIL;
 }
@@ -572,6 +592,8 @@ PGrnCreateCustomScanState(CustomScan *cscan)
 	state->indexOID = PGrnCustomPrivateGetIndexOID(cscan->custom_private);
 	state->scanKeySources =
 		PGrnCustomPrivateGetScanKeySources(cscan->custom_private);
+	state->otherQuals = PGrnCustomPrivateGetOtherQuals(cscan->custom_private);
+	state->otherExprState = NULL;
 	state->pathKeys = PGrnCustomPrivateGetPathKeys(cscan->custom_private);
 
 	return (Node *) &(state->parent);
@@ -762,6 +784,115 @@ PGrnBeginCustomScan(CustomScanState *customScanState,
 	RelationClose(index);
 	PGrnSearchDataFree(&(state->searchData));
 	memset(&(state->searchData), 0, sizeof(state->searchData));
+
+	if (state->otherQuals)
+	{
+		// todo
+		// We support complex conditions.
+		// Currently, only simple AND conditions are supported.
+		BoolExpr *andExpr = makeNode(BoolExpr);
+		andExpr->boolop = AND_EXPR;
+		andExpr->args = state->otherQuals;
+
+		state->otherExprState =
+			ExecInitExpr((Expr *) andExpr, &(customScanState->ss.ps));
+	}
+}
+
+static TupleTableSlot *
+PGrnResultTupleSlot(CustomScanState *customScanState, grn_id id, ItemPointerData ctid)
+{
+	PGrnScanState *state = (PGrnScanState *) customScanState;
+	Relation table = customScanState->ss.ss_currentRelation;
+	TupleTableSlot *slot = customScanState->ss.ps.ps_ResultTupleSlot;
+	ExprContext *econtext = customScanState->ss.ps.ps_ExprContext;
+	unsigned int ttsIndex = 0;
+	unsigned int varIndex = 0;
+	ListCell *cell;
+
+	ExecClearTuple(slot);
+	econtext->ecxt_scantuple = slot;
+	// We might add state->targetlist instead of ss.ps.plan->targetlist.
+	foreach (cell, customScanState->ss.ps.plan->targetlist)
+	{
+		TargetEntry *entry = (TargetEntry *) lfirst(cell);
+		GRN_BULK_REWIND(&(state->columnValue));
+
+		if (IsA(entry->expr, Var))
+		{
+			grn_obj *column = GRN_PTR_VALUE_AT(&(state->columns), varIndex);
+			varIndex++;
+			if (column)
+			{
+				Oid typeID = exprType((Node *) (entry->expr));
+				grn_obj_get_value(ctx, column, id, &(state->columnValue));
+				slot->tts_values[ttsIndex] =
+					PGrnConvertToDatum(&(state->columnValue), typeID);
+				// todo
+				// If there are nullable columns, do not custom scan.
+				// See also
+				// https://github.com/pgroonga/pgroonga/pull/742#discussion_r2107937927
+				slot->tts_isnull[ttsIndex] = false;
+			}
+			else
+			{
+				bool found = false;
+				TupleTableSlot *tupleSlot = MakeSingleTupleTableSlot(
+						RelationGetDescr(table), &TTSOpsBufferHeapTuple);
+				found = table_tuple_fetch_row_version(
+						table, &ctid, GetTransactionSnapshot(), tupleSlot);
+				if (found)
+				{
+					Var *var = (Var *) entry->expr;
+					bool isnull = false;
+					slot->tts_values[ttsIndex] =
+						slot_getattr(tupleSlot, var->varattno, &isnull);
+					slot->tts_isnull[ttsIndex] = isnull;
+				}
+				else
+				{
+					slot->tts_values[ttsIndex] = 0;
+					slot->tts_isnull[ttsIndex] = true;
+				}
+				ExecDropSingleTupleTableSlot(tupleSlot);
+			}
+		}
+		else if (IsA(entry->expr, FuncExpr))
+		{
+			FuncExpr *funcExpr = (FuncExpr *) (entry->expr);
+			if (strcmp(get_func_name(funcExpr->funcid), "pgroonga_score") ==
+					0)
+			{
+				// todo
+				// Reject this function if the argument isn't
+				// `(tableoid, ctid)` nor `(record)`.
+				grn_obj_get_value(
+						ctx, state->scoreAccessor, id, &(state->columnValue));
+				slot->tts_values[ttsIndex] =
+					PGrnConvertToDatum(&(state->columnValue), FLOAT8OID);
+				slot->tts_isnull[ttsIndex] = false;
+			}
+			else
+			{
+				// todo
+				// Initialization in BeginCustomScan.
+				// See also
+				// https://github.com/pgroonga/pgroonga/pull/783/files#r2374165154
+				ExprState *state = ExecInitExpr((Expr *) funcExpr, NULL);
+				bool isNull = false;
+				ResetExprContext(econtext);
+				slot->tts_values[ttsIndex] =
+					ExecEvalExpr(state, econtext, &isNull);
+				slot->tts_isnull[ttsIndex] = isNull;
+			}
+		}
+		ttsIndex++;
+	}
+
+	if (!state->otherExprState || ExecQual(state->otherExprState, econtext))
+		return ExecStoreVirtualTuple(slot);
+	else
+		return NULL;
 }
 
 static TupleTableSlot *
@@ -778,12 +909,13 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 		return NULL;
 
 	state = (PGrnScanState *) customScanState;
-	table = customScanState->ss.ss_currentRelation;
 	if (!state->tableCursor)
 		return NULL;
 
+	table = customScanState->ss.ss_currentRelation;
 	while (true)
 	{
+		TupleTableSlot *slot;
 		id = grn_table_cursor_next(ctx, state->tableCursor);
 		if (id == GRN_ID_NIL)
 			return NULL;
@@ -792,106 +924,23 @@ PGrnExecCustomScan(CustomScanState *customScanState)
 		grn_obj_get_value(ctx, state->ctidAccessor, id, &(state->columnValue));
 		packedCtid = GRN_UINT64_VALUE(&(state->columnValue));
 		ctid = PGrnCtidUnpack(packedCtid);
-		if (PGrnCtidIsAlive(table, &ctid))
-			break;
-
-		GRN_LOG(ctx,
-				GRN_LOG_DEBUG,
-				"%s[dead] <%s>: <(%u,%u),%u>",
-				tag,
-				table->rd_rel->relname.data,
-				ctid.ip_blkid.bi_hi,
-				ctid.ip_blkid.bi_lo,
-				ctid.ip_posid);
-	}
-
-	{
-		TupleTableSlot *slot = customScanState->ss.ps.ps_ResultTupleSlot;
-		unsigned int ttsIndex = 0;
-		unsigned int varIndex = 0;
-		ListCell *cell;
-
-		ExecClearTuple(slot);
-		// We might add state->targetlist instead of ss.ps.plan->targetlist.
-		foreach (cell, customScanState->ss.ps.plan->targetlist)
+		if (!PGrnCtidIsAlive(table, &ctid))
 		{
-			TargetEntry *entry = (TargetEntry *) lfirst(cell);
-			GRN_BULK_REWIND(&(state->columnValue));
-
-			if (IsA(entry->expr, Var))
-			{
-				grn_obj *column = GRN_PTR_VALUE_AT(&(state->columns), varIndex);
-				varIndex++;
-				if (column)
-				{
-					Oid typeID = exprType((Node *) (entry->expr));
-					grn_obj_get_value(ctx, column, id, &(state->columnValue));
-					slot->tts_values[ttsIndex] =
-						PGrnConvertToDatum(&(state->columnValue), typeID);
-					// todo
-					// If there are nullable columns, do not custom scan.
-					// See also
-					// https://github.com/pgroonga/pgroonga/pull/742#discussion_r2107937927
-					slot->tts_isnull[ttsIndex] = false;
-				}
-				else
-				{
-					bool found = false;
-					TupleTableSlot *tupleSlot = MakeSingleTupleTableSlot(
-						RelationGetDescr(table), &TTSOpsBufferHeapTuple);
-					found = table_tuple_fetch_row_version(
-						table, &ctid, GetTransactionSnapshot(), tupleSlot);
-					if (found)
-					{
-						Var *var = (Var *) entry->expr;
-						bool isnull = false;
-						slot->tts_values[ttsIndex] =
-							slot_getattr(tupleSlot, var->varattno, &isnull);
-						slot->tts_isnull[ttsIndex] = isnull;
-					}
-					else
-					{
-						slot->tts_values[ttsIndex] = 0;
-						slot->tts_isnull[ttsIndex] = true;
-					}
-					ExecDropSingleTupleTableSlot(tupleSlot);
-				}
-			}
-			else if (IsA(entry->expr, FuncExpr))
-			{
-				FuncExpr *funcExpr = (FuncExpr *) (entry->expr);
-				if (strcmp(get_func_name(funcExpr->funcid), "pgroonga_score") ==
-					0)
-				{
-					// todo
-					// Reject this function if the argument isn't
-					// `(tableoid, ctid)` nor `(record)`.
-					grn_obj_get_value(
-						ctx, state->scoreAccessor, id, &(state->columnValue));
-					slot->tts_values[ttsIndex] =
-						PGrnConvertToDatum(&(state->columnValue), FLOAT8OID);
-					slot->tts_isnull[ttsIndex] = false;
-				}
-				else
-				{
-					ExprContext *econtext =
-						customScanState->ss.ps.ps_ExprContext;
-					// todo
-					// Initialization in BeginCustomScan.
-					// See also
-					// https://github.com/pgroonga/pgroonga/pull/783/files#r2374165154
-					ExprState *state = ExecInitExpr((Expr *) funcExpr, NULL);
-					bool isNull = false;
-					ResetExprContext(econtext);
-					slot->tts_values[ttsIndex] =
-						ExecEvalExpr(state, econtext, &isNull);
-					slot->tts_isnull[ttsIndex] = isNull;
-				}
-			}
-			ttsIndex++;
+			GRN_LOG(ctx,
+					GRN_LOG_DEBUG,
+					"%s[dead] <%s>: <(%u,%u),%u>",
+					tag,
+					table->rd_rel->relname.data,
+					ctid.ip_blkid.bi_hi,
+					ctid.ip_blkid.bi_lo,
+					ctid.ip_posid);
+			continue;
 		}
-		return ExecStoreVirtualTuple(slot);
+		slot = PGrnResultTupleSlot(customScanState, id, ctid);
+		if (slot)
+			return slot;
 	}
+	return NULL;
 }
 
 static void
@@ -912,6 +961,8 @@ PGrnEndCustomScan(CustomScanState *customScanState)
 	ExecClearTuple(customScanState->ss.ps.ps_ResultTupleSlot);
 	state->indexOID = InvalidOid;
 	state->scanKeySources = NIL;
+	state->otherQuals = NIL;
+	state->otherExprState = NULL;
 	state->pathKeys = NIL;
 
 	if (state->tableCursor)
