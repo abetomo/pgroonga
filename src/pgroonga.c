@@ -849,6 +849,12 @@ PGrnConvertToDatumArrayType(grn_obj *vector, Oid typeID)
 		elementByValue = true;
 		elementAlign = 'i';
 		break;
+	case FLOAT4ARRAYOID:
+		elementTypeID = FLOAT4OID;
+		elementLength = 4;
+		elementByValue = true;
+		elementAlign = 'i';
+		break;
 	case VARCHARARRAYOID:
 		elementTypeID = VARCHAROID;
 		elementLength = -1;
@@ -1004,6 +1010,7 @@ PGrnConvertToDatum(grn_obj *value, Oid typeID)
 		break;
 #endif
 	case INT4ARRAYOID:
+	case FLOAT4ARRAYOID:
 	case VARCHARARRAYOID:
 	case TEXTARRAYOID:
 		return PGrnConvertToDatumArrayType(value, typeID);
