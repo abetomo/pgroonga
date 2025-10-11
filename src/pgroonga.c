@@ -19,6 +19,7 @@
 #include "pgrn-index-status.h"
 #include "pgrn-jsonb.h"
 #include "pgrn-keywords.h"
+#include "pgrn-language-model-vectorize.h"
 #include "pgrn-match-positions-byte.h"
 #include "pgrn-match-positions-character.h"
 #include "pgrn-normalize.h"
@@ -431,6 +432,9 @@ PGrnBeforeShmemExit(int code, Datum arg)
 			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][auto-close]", tag);
 			PGrnFinalizeAutoClose();
 
+			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][language-model-vectorize]", tag);
+			PGrnFinalizeLanguageModelVectorize();
+
 			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][normalize]", tag);
 			PGrnFinalizeNormalize();
 
@@ -574,6 +578,8 @@ PGrnInitializeDatabase(void)
 	PGrnInitializeTokenize();
 
 	PGrnInitializeNormalize();
+
+	PGrnInitializeLanguageModelVectorize();
 
 	PGrnInitializeAutoClose();
 }
