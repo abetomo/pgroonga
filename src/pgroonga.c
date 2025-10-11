@@ -432,7 +432,10 @@ PGrnBeforeShmemExit(int code, Datum arg)
 			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][auto-close]", tag);
 			PGrnFinalizeAutoClose();
 
-			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][language-model-vectorize]", tag);
+			GRN_LOG(ctx,
+					GRN_LOG_DEBUG,
+					"%s[finalize][language-model-vectorize]",
+					tag);
 			PGrnFinalizeLanguageModelVectorize();
 
 			GRN_LOG(ctx, GRN_LOG_DEBUG, "%s[finalize][normalize]", tag);

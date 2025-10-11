@@ -465,6 +465,13 @@ CREATE FUNCTION pgroonga_language_model_vectorize(model_name text, target text)
 	STRICT
 	PARALLEL SAFE;
 
+CREATE FUNCTION pgroonga_language_model_vectorizer(table_name text, column_name text, model_name text)
+    RETURNS SETOF float4[]
+	AS 'MODULE_PATHNAME', 'pgroonga_language_model_vectorizer'
+	LANGUAGE C
+	STRICT
+	PARALLEL SAFE;
+
 /* v1 */
 CREATE FUNCTION pgroonga_match_term(target text, term text)
 	RETURNS bool
