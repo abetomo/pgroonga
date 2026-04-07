@@ -41,7 +41,16 @@ pgrn_crash_safer_statuses_get(void)
 	info.entrysize = sizeof(pgrn_crash_safer_statuses_entry);
 	info.hash = pgrn_crash_safer_statuses_hash;
 	flags = HASH_ELEM | HASH_FUNCTION;
+	/* TODO: Migrate to ShmemRequestHash/RegisterShmemCallbacks when dropping
+	 * support for PostgreSQL 18 and earlier.
+	 * See:
+	 * https://github.com/postgres/postgres/commit/283e823f9dcb03d0be720928b261628af06d3fd4
+	 */
+#if PG_VERSION_NUM >= 190000
+	return ShmemInitHash(name, 32 /* TODO: configurable */, &info, flags);
+#else
 	return ShmemInitHash(name, 1, 32 /* TODO: configurable */, &info, flags);
+#endif
 }
 
 static inline pgrn_crash_safer_statuses_entry *
