@@ -723,11 +723,17 @@ SELECT pid FROM pg_stat_activity WHERE backend_type = 'startup';
     select = "SELECT id FROM pages WHERE content &@~ 'that';"
     # wait for all WALs are applied on standby
     primary_lsn = run_sql("SELECT pg_current_wal_lsn();")[0][/\h+\/\h+/]
-    60.times do
+    60.times do |i|
+      puts "times #{i}"
       replayed = run_sql_standby("SELECT pg_last_wal_replay_lsn() >= '#{primary_lsn}'::pg_lsn AS replayed;")[0]
-      break if replayed[/^ +([tf])$/, 1] == "t"
+      if replayed[/^ +([tf])$/, 1] == "t"
+        puts "replayed == 't'"
+        break
+      end
       sleep(1)
     end
+    puts("primary_lsn=#{primary_lsn}")
+    puts("standby lsn=" + run_sql_standby("SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();")[0])
     assert_equal(run_sql(select), run_sql_standby(select))
   end
 
